@@ -1,0 +1,83 @@
+services:
+  mongodb:
+    image: mongo:latest
+    container_name: ims-mongo
+    restart: always
+    env_file:
+      - ./config/mongodb.env
+    volumes:
+      - my_mongo_data:/data/db
+    networks:
+      - ims-network
+  mongo-express:
+    image: mongo-express
+    container_name: ims-mongo-express
+    restart: always
+    env_file:
+      - ./config/mongo-express.env
+    ports:
+      - "8081:8081"
+    depends_on:
+      - mongodb
+    networks:
+      - ims-network
+
+  backend:
+    build:
+      context: ./Backend
+      dockerfile: Dockerfile
+    container_name: ims-backend
+    restart: always
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./config/backend.env
+    depends_on:
+      - mongodb
+    networks:
+      - ims-network
+
+  frontend:
+    build:
+      context: ./Frontend
+      dockerfile: Dockerfile
+    container_name: ims-frontend
+    restart: always
+    ports:
+      - "80:80"
+    env_file:
+      - ./Frontend/.env
+    depends_on:
+      - backend
+    networks:
+      - ims-network
+
+  # nginx:
+  #   image: nginx:alpine
+  #   container_name: ims-nginx
+  #   restart: always
+  #   ports:
+  #     - "80:80"
+  #     - "443:443"
+  #   volumes:
+  # #     # - ./nginx/conf.d:/etc/nginx/conf.d
+  #     - ./nginx/default.conf:/etc/nginx/conf.d/default.conf
+  #     - /etc/letsencrypt/live/prince-opah.name.ng:/etc/letsencrypt/live/prince-opah.name.ng:ro
+  #     - /etc/letsencrypt/archive/prince-opah.name.ng:/etc/letsencrypt/archive/prince-opah.name.ng:ro
+  # #     # - ./build:/usr/share/nginx/html
+  # #     # - /etc/letsencrypt:/etc/letsencrypt:ro
+  # #     # - certbot-var:/var/lib/letsencrypt
+  #   depends_on:
+  #     - frontend
+  #     - backend
+  #   networks:
+  #     - ims-network
+
+volumes:
+  my_mongo_data:
+  certbot-etc:
+  certbot-var:
+
+networks:
+  ims-network:
+    driver: bridge

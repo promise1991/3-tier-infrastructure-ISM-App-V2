@@ -1,0 +1,124 @@
+# ================================================================
+# MAIN BRANCH — BUILD ONLY PIPELINE
+# ================================================================
+# WHEN: triggers on push to main branch
+# WHAT: builds AMIs and stops — waits for manual deployment
+# WHY:  production deployments should never be automatic
+#       a human must review and approve before going live
+# ================================================================
+
+name: Build Production AMIs
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  build-web-ami:
+    name: Build Web AMI
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      web_ami_id: ${{ steps.build.outputs.web_ami_id }}
+    steps:
+      - name: Checkout infrastructure code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Packer
+        uses: hashicorp/setup-packer@main
+        with:
+          version: latest
+
+      - name: Build Web AMI
+        id: build
+        run: |
+          cd Packer/
+          packer init web-tier-v4.pkr.hcl
+          PACKER_OUTPUT=$(packer build -machine-readable web-tier-v4.pkr.hcl 2>&1)
+          EXIT_CODE=$?
+          echo "$PACKER_OUTPUT"
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo "Packer build failed!"
+            exit $EXIT_CODE
+          fi
+          WEB_AMI_ID=$(echo "$PACKER_OUTPUT" | grep 'artifact,0,id' | awk -F',' '{print $NF}' | cut -d':' -f2)
+          if [ -z "$WEB_AMI_ID" ]; then
+            echo "ERROR: Failed to extract AMI ID!"
+            exit 1
+          fi
+          echo "Web AMI built: $WEB_AMI_ID"
+          echo "web_ami_id=$WEB_AMI_ID" >> $GITHUB_OUTPUT
+
+  build-app-ami:
+    name: Build App AMI
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      app_ami_id: ${{ steps.build.outputs.app_ami_id }}
+    steps:
+      - name: Checkout infrastructure code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Packer
+        uses: hashicorp/setup-packer@main
+        with:
+          version: latest
+
+      - name: Build App AMI
+        id: build
+        run: |
+          cd Packer/
+          packer init app-tier.pkr.hcl
+          PACKER_OUTPUT=$(packer build -machine-readable app-tier.pkr.hcl 2>&1)
+          EXIT_CODE=$?
+          echo "$PACKER_OUTPUT"
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo "Packer build failed!"
+            exit $EXIT_CODE
+          fi
+          APP_AMI_ID=$(echo "$PACKER_OUTPUT" | grep 'artifact,0,id' | awk -F',' '{print $NF}' | cut -d':' -f2)
+          if [ -z "$APP_AMI_ID" ]; then
+            echo "ERROR: Failed to extract AMI ID!"
+            exit 1
+          fi
+          echo "App AMI built: $APP_AMI_ID"
+          echo "app_ami_id=$APP_AMI_ID" >> $GITHUB_OUTPUT
+
+  notify-ready-for-deployment:
+    name: Notify - Ready For Deployment
+    runs-on: ubuntu-latest
+    needs: [build-web-ami, build-app-ami]
+    steps:
+      - name: Production Deployment Ready
+        run: |
+          echo "================================================"
+          echo "PRODUCTION AMIs BUILT SUCCESSFULLY!"
+          echo "================================================"
+          echo "Web AMI: ${{ needs.build-web-ami.outputs.web_ami_id }}"
+          echo "App AMI: ${{ needs.build-app-ami.outputs.app_ami_id }}"
+          echo ""
+          echo "ACTION REQUIRED:"
+          echo "Go to Actions tab and manually run:"
+          echo "Deploy Production workflow"
+          echo "with these AMI IDs to deploy to production"
+          echo "================================================"

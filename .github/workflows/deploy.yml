@@ -1,0 +1,271 @@
+# ================================================================
+# INFRA REPO - DEPLOY PIPELINE
+# ================================================================
+# WHEN: triggered by app repo sending deploy-dev signal
+# WHAT: builds new AMI → updates launch template → refreshes ASG
+# WHY: infrastructure changes are controlled separately from app code
+# ================================================================
+
+name: Deploy Infrastructure
+
+on:
+  # Listens for signal from app repo
+  # Only triggers when app repo sends 'deploy-dev' event
+  repository_dispatch:
+    types: [deploy-dev]
+
+  # Also allows manual trigger from GitHub UI
+  # Useful for DevOps to deploy without a code change
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to deploy to"
+        required: true
+        default: "dev"
+        type: choice
+        options:
+          - dev
+          - staging
+          - production
+
+env:
+  AWS_REGION: us-east-1
+  APP_ASG_NAME: app-asg
+  WEB_ASG_NAME: web-asg
+
+jobs:
+  # ================================================================
+  # JOB 1 - BUILD WEB AMI
+  # Bakes a new AMI with latest Frontend code
+  # ================================================================
+  build-web-ami:
+    name: Build Web AMI
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write # needed for OIDC authentication
+      contents: read
+
+    outputs:
+      # Passes the new AMI ID to the deploy job
+      web_ami_id: ${{ steps.build.outputs.web_ami_id }}
+
+    steps:
+      - name: Checkout infrastructure code
+        uses: actions/checkout@v4
+
+      # OIDC Authentication
+      # GitHub proves identity → AWS gives temporary token
+      # No permanent credentials stored anywhere!
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Install Packer on GitHub's machine
+      - name: Setup Packer
+        uses: hashicorp/setup-packer@main
+        with:
+          version: latest
+
+      # Download Packer AWS plugin
+      - name: Packer Init
+        run: packer init Packer/web-tier-v4.pkr.hcl
+
+      # Build the Web AMI
+      # machine-readable: output in parseable format
+      # grep artifact: find the AMI ID in the output
+      # cut -d: -f2: extract just the AMI ID
+      - name: Build Web AMI
+        id: build
+        run: |
+          echo "🔨 Building Web AMI..."
+          cd Packer/
+          packer init web-tier-v4.pkr.hcl
+          packer build -debug web-tier-v4.pkr.hcl 2>&1 || true
+          PACKER_OUTPUT=$(packer build -machine-readable web-tier-v4.pkr.hcl 2>&1)
+          EXIT_CODE=$?
+          echo "$PACKER_OUTPUT"
+    
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo "❌ Packer build failed with exit code $EXIT_CODE"
+            exit $EXIT_CODE
+          fi
+    
+          WEB_AMI_ID=$(echo "$PACKER_OUTPUT" | \
+            grep 'artifact,0,id' | \
+            awk -F',' '{print $NF}' | \
+            cut -d':' -f2)
+    
+          echo "✅ Web AMI built: $WEB_AMI_ID"
+    
+          if [ -z "$WEB_AMI_ID" ]; then
+            echo "❌ ERROR: Failed to extract AMI ID!"
+            exit 1
+          fi
+    
+          echo "web_ami_id=$WEB_AMI_ID" >> $GITHUB_OUTPUT
+
+  # ================================================================
+  # JOB 2 - BUILD APP AMI
+  # Bakes a new AMI with latest Backend code
+  # Runs in parallel with Job 1 to save time!
+  # ================================================================
+  build-app-ami:
+    name: Build App AMI
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+      contents: read
+
+    outputs:
+      app_ami_id: ${{ steps.build.outputs.app_ami_id }}
+
+    steps:
+      - name: Checkout infrastructure code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Packer
+        uses: hashicorp/setup-packer@main
+        with:
+          version: latest
+
+      - name: Packer Init
+        run: packer init Packer/app-tier.pkr.hcl
+
+      - name: Build App AMI
+        id: build
+        run: |
+          echo "🔨 Building App AMI..."
+          cd Packer/
+          packer init app-tier.pkr.hcl
+    
+          PACKER_OUTPUT=$(packer build -machine-readable app-tier.pkr.hcl 2>&1)
+          EXIT_CODE=$?
+          echo "$PACKER_OUTPUT"
+    
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo "❌ Packer build failed with exit code $EXIT_CODE"
+            exit $EXIT_CODE
+          fi
+    
+          APP_AMI_ID=$(echo "$PACKER_OUTPUT" | \
+           grep 'artifact,0,id' | \
+           awk -F',' '{print $NF}' | \
+           cut -d':' -f2)
+    
+           echo "✅ App AMI built: $APP_AMI_ID"
+    
+           if [ -z "$APP_AMI_ID" ]; then
+             echo "❌ ERROR: Failed to extract AMI ID!"
+             exit 1
+           fi
+    
+          echo "app_ami_id=$APP_AMI_ID" >> $GITHUB_OUTPUT
+
+  # ================================================================
+  # JOB 3 - DEPLOY
+  # Updates launch templates and refreshes ASG instances
+  # Only runs after BOTH AMI builds complete successfully!
+  # ================================================================
+  deploy:
+    name: Deploy to AWS
+    runs-on: ubuntu-latest
+    # Waits for BOTH build jobs to complete
+    needs: [build-web-ami, build-app-ami]
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout infrastructure code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Update Web Launch Template with new AMI ID
+      # Why: ASG uses launch template to know which AMI to use
+      # Creating new version → setting as default → ASG picks it up
+      - name: Update Web Launch Template
+        run: |
+          echo "📝 Updating Web Launch Template..."
+          aws ec2 create-launch-template-version \
+            --launch-template-name web-launch-template \
+            --source-version '$Latest' \
+            --launch-template-data \
+            "{\"ImageId\":\"${{ needs.build-web-ami.outputs.web_ami_id }}\"}"
+
+          aws ec2 modify-launch-template \
+            --launch-template-name web-launch-template \
+            --default-version '$Latest'
+
+          echo "✅ Web Launch Template updated!"
+
+      # Update App Launch Template
+      - name: Update App Launch Template
+        run: |
+          echo "📝 Updating App Launch Template..."
+          aws ec2 create-launch-template-version \
+            --launch-template-name app-launch-template \
+            --source-version '$Latest' \
+            --launch-template-data \
+            "{\"ImageId\":\"${{ needs.build-app-ami.outputs.app_ami_id }}\"}"
+
+          aws ec2 modify-launch-template \
+            --launch-template-name app-launch-template \
+            --default-version '$Latest'
+
+          echo "✅ App Launch Template updated!"
+
+      # Trigger ASG Instance Refresh
+      # Why: This replaces old instances with new ones gradually
+      # MinHealthyPercentage: 50 means at least half stay up during refresh
+      # InstanceWarmup: 300 seconds for new instance to be ready
+      # Rolling deploy — zero downtime! 🚀
+      - name: Refresh Web ASG
+        run: |
+          echo "🔄 Starting Web ASG instance refresh..."
+          aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name ${{ env.WEB_ASG_NAME }} \
+            --preferences '{
+              "MinHealthyPercentage": 50,
+              "InstanceWarmup": 300
+            }'
+          echo "✅ Web ASG refresh started!"
+
+      - name: Refresh App ASG
+        run: |
+          echo "🔄 Starting App ASG instance refresh..."
+          aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name ${{ env.APP_ASG_NAME }} \
+            --preferences '{
+              "MinHealthyPercentage": 50,
+              "InstanceWarmup": 300
+            }'
+          echo "✅ App ASG refresh started!"
+
+      # Deployment Summary
+      - name: Deployment Summary
+        run: |
+          echo "================================================"
+          echo "🎉 DEPLOYMENT COMPLETE!"
+          echo "================================================"
+          echo "Environment : ${{ github.event.client_payload.environment || inputs.environment }}"
+          echo "Triggered by: ${{ github.event.client_payload.actor || github.actor }}"
+          echo "Commit SHA  : ${{ github.event.client_payload.sha || github.sha }}"
+          echo "Web AMI     : ${{ needs.build-web-ami.outputs.web_ami_id }}"
+          echo "App AMI     : ${{ needs.build-app-ami.outputs.app_ami_id }}"
+          echo "================================================"

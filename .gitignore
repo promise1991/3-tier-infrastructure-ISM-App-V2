@@ -1,0 +1,38 @@
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfplan
+crash.log
+
+# Sensitive credentials
+.env
+.env.*
+*.pem
+*.key
+*.ppk
+credentials
+*.env
+App/IMG/config/backend.env
+App/IMG/config/mongo-express.env
+App/IMG/config/mongodb.env
+
+# Private SSH keys
+id_rsa
+id_ed25519
+
+# Binary installers
+*.deb
+
+# Node.js
+node_modules/
+npm-debug.log*
+
+# Build files
+dist/
+build/
+
+# Operating system
+.DS_Store
+Thumbs.db
